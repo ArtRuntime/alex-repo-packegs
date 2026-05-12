@@ -1,0 +1,211 @@
+name: monorepo-auto-update
+
+on:
+  schedule:
+    - cron: "0 3 * * *"      # 9 AM IST
+    - cron: "0 */9 * * *"    # every 9 hours
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          # Install global dependencies that packages might need
+          pip install requests bs4
+
+      - name: Fetch previous state
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Try to download the versions.json and database from the 'latest' release
+          # If they don't exist (e.g., first run), we just start fresh!
+          gh release download latest -p "versions.json" || echo "{}" > versions.json
+          gh release download latest -p "alex-repo.db.tar.gz" || true
+
+      - name: Check for updates and prepare builds
+        id: check
+        run: |
+          UPDATE_FOUND=false
+          mkdir -p to_build
+          
+          # Loop through every directory in the monorepo
+          for pkg_dir in */ ; do
+            if [ -f "${pkg_dir}main.py" ] && [ -f "${pkg_dir}PKGBUILD.template" ]; then
+              pkg_name=$(basename "$pkg_dir")
+              cd "$pkg_dir"
+              
+              echo "Checking $pkg_name..."
+              
+              # Run python script to get latest available version
+              if [ -f requirements.txt ]; then pip install -r requirements.txt > /dev/null 2>&1; fi
+              NEW_JSON=$(python main.py)
+              NEW_VERSION=$(echo "$NEW_JSON" | jq -r '.version')
+              NEW_SHA256=$(echo "$NEW_JSON" | jq -r '.sha256')
+              NEW_URL=$(echo "$NEW_JSON" | jq -r '.url')
+              
+              # Get old version from versions.json
+              OLD_VERSION=$(cat ../versions.json | jq -r ".[\"$pkg_name\"] // \"0.0.0\"")
+              
+              if [ "$OLD_VERSION" != "$NEW_VERSION" ] || [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+                echo " -> Needs update! ($OLD_VERSION -> $NEW_VERSION)"
+                UPDATE_FOUND=true
+                
+                # Update versions.json state
+                jq ".[\"$pkg_name\"] = \"$NEW_VERSION\"" ../versions.json > ../versions.tmp && mv ../versions.tmp ../versions.json
+                
+                # Template PKGBUILD
+                escaped_url=$(echo "$NEW_URL" | sed 's/[&/\]/\\&/g')
+                sed "s/{VERSION}/$NEW_VERSION/g; s/{SHA256}/$NEW_SHA256/g; s|{URL}|$NEW_URL|g" PKGBUILD.template > PKGBUILD
+                
+                # Copy into build staging area
+                mkdir -p ../to_build/$pkg_name
+                cp -r * ../to_build/$pkg_name/
+              else
+                echo " -> Up to date ($OLD_VERSION)"
+              fi
+              cd ..
+            fi
+          done
+          
+          echo "update_found=$UPDATE_FOUND" >> $GITHUB_OUTPUT
+
+      - name: Build Packages in Arch Container
+        if: steps.check.outputs.update_found == 'true'
+        run: |
+          docker run --rm \
+            -v ${{ github.workspace }}:/workspace \
+            -w /workspace \
+            archlinux:latest \
+            bash -c "
+              pacman -Syu --noconfirm base-devel sudo git
+              useradd -m builder
+              echo 'builder ALL=(ALL) NOPASSWD: ALL' >> /etc/sudoers
+              chown -R builder /workspace
+              
+              su builder -c '
+                mkdir -p new_packages
+                
+                # Build each updated package
+                for pkg_dir in to_build/*/; do
+                  if [ -d \"\$pkg_dir\" ]; then
+                    cd \"\$pkg_dir\"
+                    makepkg -sf --noconfirm
+                    mv *.pkg.tar.zst ../../new_packages/
+                    cd ../../
+                  fi
+                done
+                
+                # Append new packages to the database (or create a new one)
+                cd new_packages
+                if [ -f \"../alex-repo.db.tar.gz\" ]; then
+                  cp ../alex-repo.db.tar.gz ./
+                fi
+                repo-add alex-repo.db.tar.gz *.pkg.tar.zst
+                
+                # Stage files for publishing
+                mkdir -p ../publish
+                mv *.pkg.tar.zst ../publish/
+                mv alex-repo.db* ../publish/
+                mv alex-repo.files* ../publish/
+              '
+            "
+
+      - name: Import GPG
+        if: steps.check.outputs.update_found == 'true' && env.GPG_PRIVATE_KEY != ''
+        uses: crazy-max/ghaction-import-gpg@v7
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+        with:
+          gpg_private_key: ${{ secrets.GPG_PRIVATE_KEY }}
+          passphrase: ${{ secrets.GPG_PASSPHRASE }}
+          trust_level: 5
+
+      - name: Sign Packages and Prepare Release
+        if: steps.check.outputs.update_found == 'true'
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+        run: |
+          # Fix directory permissions because the Docker container changed the owner to 'builder'
+          sudo chown -R $USER:$USER .
+          cd publish
+          
+          # Native Ubuntu GPG Signing
+          if [ -n "$GPG_PRIVATE_KEY" ]; then
+            echo "Signing Packages..."
+            for pkg in *.pkg.tar.zst; do
+              gpg --batch --detach-sign --yes --no-armor "$pkg"
+            done
+            
+            echo "Signing Databases..."
+            gpg --batch --detach-sign --yes --no-armor alex-repo.db.tar.gz
+            gpg --batch --detach-sign --yes --no-armor alex-repo.files.tar.gz
+          else
+            echo "::warning::GPG_PRIVATE_KEY is empty. Skipping signing."
+          fi
+          
+          # GitHub Releases cannot upload symlinks (size 0). Replace them with real file copies.
+          rm -f alex-repo.db alex-repo.db.sig alex-repo.files alex-repo.files.sig
+          cp alex-repo.db.tar.gz alex-repo.db
+          [ -f alex-repo.db.tar.gz.sig ] && cp alex-repo.db.tar.gz.sig alex-repo.db.sig || true
+          cp alex-repo.files.tar.gz alex-repo.files
+          [ -f alex-repo.files.tar.gz.sig ] && cp alex-repo.files.tar.gz.sig alex-repo.files.sig || true
+          
+          # Cleanup any 0-byte signature files left behind if GPG failed
+          find . -name "*.sig" -size 0 -delete
+          
+          # Copy the state file so we can upload it
+          cp ../versions.json ./
+          
+          # Generate release notes
+          echo "Automated rolling release for Monorepo packages." > release_notes.md
+          echo "Latest updates included in this run." >> release_notes.md
+
+          # Strict enforcement: Fail the build if the package signature is missing
+          if [ -n "$GPG_PRIVATE_KEY" ] && ! ls *.pkg.tar.zst.sig 1> /dev/null 2>&1; then
+            echo "::error::Package signature (*.pkg.tar.zst.sig) is missing! GPG signing failed on Ubuntu host. Aborting release."
+            exit 1
+          fi
+
+      - name: Publish Rolling Release
+        if: steps.check.outputs.update_found == 'true'
+        uses: softprops/action-gh-release@v2.5.0
+        with:
+          tag_name: latest
+          name: Arch Linux Rolling Repository
+          body_path: publish/release_notes.md
+          files: |
+            publish/*
+          overwrite_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Trigger Mirror Dashboard Sync
+        if: steps.check.outputs.update_found == 'true'
+        env:
+          SYNC_API_KEY: ${{ secrets.SYNC_API_KEY }}
+          SYNC_URL: ${{ secrets.SYNC_URL }}
+        run: |
+          if [ -n "$SYNC_API_KEY" ] && [ -n "$SYNC_URL" ]; then
+            echo "Triggering webhook to update Mirror Dashboard at $SYNC_URL..."
+            curl -X POST "$SYNC_URL" \
+              -H "Content-Type: application/json" \
+              -H "Authorization: Bearer $SYNC_API_KEY" \
+              -d "{\"githubRepo\": \"${{ github.repository }}\"}"
+          else
+            echo "No SYNC_API_KEY or SYNC_URL configured. Skipping dashboard sync."
+          fi

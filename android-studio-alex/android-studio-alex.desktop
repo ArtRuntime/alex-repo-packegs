@@ -1,0 +1,19 @@
+
+[Desktop Entry]
+Categories=Development;IDE;
+Comment=The official Android IDE for Android development
+Comment[en_US]=The official Android IDE for Android development
+Exec=android-studio-alex %f
+GenericName=Android Studio
+GenericName[en_US]=Android Studio
+Icon=android-studio-alex
+MimeType=text/xml;application/vnd.android.package-archive;application/x-gradle+json;
+Name=Android Studio
+Name[en_US]=Android Studio
+
+StartupNotify=true
+StartupWMClass=jetbrains-studio
+Terminal=false
+Type=Application
+Version=1.0
+X-KDE-SubstituteUID=false
